@@ -10,7 +10,7 @@ import asyncio
 import py_nillion_client as nillion
 import os
 
-from py_nillion_client import NodeKey, UserKey
+from py_nillion_client import NodeKey, UserKey, Permissions
 from dotenv import load_dotenv
 from nillion_python_helpers import (
     get_quote_and_pay,
@@ -26,30 +26,26 @@ home = os.getenv("HOME")
 load_dotenv(f"{home}/.config/nillion/nillion-devnet.env")
 
 
+# 1 Party running simple addition on 1 stored secret and 1 compute time secret
 async def main():
-    # 1. Initial setup
-    # 1.1. Get cluster_id, grpc_endpoint, & chain_id from the .env file
     cluster_id = os.getenv("NILLION_CLUSTER_ID")
     grpc_endpoint = os.getenv("NILLION_NILCHAIN_GRPC")
     chain_id = os.getenv("NILLION_NILCHAIN_CHAIN_ID")
-    # 1.2 pick a seed and generate user and node keys
-    seed = "puter_was_here"
-    userkey = UserKey.from_seed(seed)
-    nodekey = NodeKey.from_seed(seed)
 
-    # 2. Initialize NillionClient against nillion-devnet
-    # Create Nillion Client for user
+    seed = "my_seed"
+
+    userkey = UserKey.from_seed((seed))
+    nodekey = NodeKey.from_seed((seed))
+
     client = create_nillion_client(userkey, nodekey)
-
     party_id = client.party_id
     user_id = client.user_id
 
-    # 3. Pay for and store the program
-    # Set the program name and path to the compiled program
+    party_name = "Admin"
     program_name = "main"
     program_mir_path = f"./target/{program_name}.nada.bin"
 
-    # Create payments config, client and wallet
+    # Create payments config and set up Nillion wallet with a private key to pay for operations
     payments_config = create_payments_config(chain_id, grpc_endpoint)
     payments_client = LedgerClient(payments_config)
     payments_wallet = LocalWallet(
@@ -57,7 +53,10 @@ async def main():
         prefix="nillion",
     )
 
-    # Pay to store the program and obtain a receipt of the payment
+    ##### STORE PROGRAM
+    print("-----STORE PROGRAM")
+
+    # Get cost quote, then pay for operation to store program
     receipt_store_program = await get_quote_and_pay(
         client,
         nillion.Operation.store_program(program_mir_path),
@@ -66,77 +65,82 @@ async def main():
         cluster_id,
     )
 
-    # Store the program
+    # Store program, passing in the receipt that shows proof of payment
     action_id = await client.store_program(
         cluster_id, program_name, program_mir_path, receipt_store_program
     )
 
-    # Create a variable for the program_id, which is the {user_id}/{program_name}. We will need this later
+    # Print details about stored program
     program_id = f"{user_id}/{program_name}"
     print("Stored program. action_id:", action_id)
     print("Stored program_id:", program_id)
 
-    # 4. Create the 1st secret, add permissions, pay for and store it in the network
-    # Create a secret named "my_int1" with any value, ex: 500
-    maxRange = nillion.NadaValues(
-        {
-            "Winning Number": nillion.SecretInteger(500),
-        }
-    )
+    ##### STORE SECRETS
+    print("-----STORE SECRETS")
 
-    # Set the input party for the secret
-    # The party name needs to match the party name that is storing "my_int1" in the program
-    party_name = "Admin"
+    # Create a secret
+    # maxRange = nillion.NadaValues(
+    #     {
+    #         "Winning Number": nillion.SecretInteger(500),
+    #     }
+    # )
 
-    # Set permissions for the client to compute on the program
-    permissions = nillion.Permissions.default_for_user(client.user_id)
+    # Create a permissions object to attach to the stored secret
+    permissions: Permissions = nillion.Permissions.default_for_user(client.user_id)
     permissions.add_compute_permissions({client.user_id: {program_id}})
+    permissions.add_retrieve_permissions(set([user_id, party_id]))
 
-    # Pay for and store the secret in the network and print the returned store_id
-    receipt_store = await get_quote_and_pay(
-        client,
-        nillion.Operation.store_values(maxRange, ttl_days=5),
-        payments_wallet,
-        payments_client,
-        cluster_id,
-    )
-    # Store a secret
-    store_id = await client.store_values(
-        cluster_id, maxRange, permissions, receipt_store
-    )
-    print(f"Computing using program {program_id}")
-    print(f"Use secret store_id: {store_id}")
+    # Get cost quote, then pay for operation to store the secret
+    # receipt_store = await get_quote_and_pay(
+    #     client,
+    #     nillion.Operation.store_values(maxRange, ttl_days=5),
+    #     payments_wallet,
+    #     payments_client,
+    #     cluster_id,
+    # )
 
-    # 5. Create compute bindings to set input and output parties, add a computation time secret and pay for & run the computation
+    # # Store a secret, passing in the receipt that shows proof of payment
+    # store_id = await client.store_values(
+    #     cluster_id, maxRange, permissions, receipt_store
+    # )
+
+    ##### COMPUTE
+    print("-----COMPUTE")
+
+    # Bind the parties in the computation to the client to set input and output parties
     compute_bindings = nillion.ProgramBindings(program_id)
     compute_bindings.add_input_party(party_name, party_id)
     compute_bindings.add_output_party(party_name, party_id)
 
-    # Add my_int2, the 2nd secret at computation time
-    # computation_time_secrets = nillion.NadaValues(
-    #     {"my_int2": nillion.SecretInteger(10)}
-    # )
+    # Create a computation time secret to use
+    computation_time_secrets = nillion.NadaValues(
+        {
+            "maxRange": nillion.SecretInteger(500),
+        }
+    )
 
-    # # Pay for the compute
+    # Get cost quote, then pay for operation to compute
     receipt_compute = await get_quote_and_pay(
         client,
-        nillion.Operation.compute(program_id, maxRange),
+        nillion.Operation.compute(program_id, computation_time_secrets),
         payments_wallet,
         payments_client,
         cluster_id,
     )
 
-    # Compute on the secret
-    compute_id = await client.compute(
+    # Compute, passing all params including the receipt that shows proof of payment
+    uuid = await client.compute(
         cluster_id,
         compute_bindings,
-        [store_id],
-        maxRange,
+        [],
+        computation_time_secrets,
         receipt_compute,
     )
+    print(f"Computing using program {program_id}")
+    print(f"Use secret store_id: ")
 
-    # 8. Return the computation result
-    print(f"The computation was sent to the network. compute_id: {compute_id}")
+    # Print compute result
+    print(f"The computation was sent to the network. compute_id: {uuid}")
     while True:
         compute_event = await client.next_compute_event()
         if isinstance(compute_event, nillion.ComputeFinishedEvent):
